@@ -1,0 +1,181 @@
+#! /bin/bash -e
+
+die() {
+    echo "$@" >&2
+    exit 1
+}
+
+## Parse options ###############################################################
+
+ACK_MODE=on_confirm # set to on_publish to risk losing messages rather than sending dupes
+declare -a HEADERS
+ROUTING_KEY= # you win a prize if you know a use for this
+SOURCE_NODENAME=rabbit
+while getopts "a:h:k:n:" flag
+do
+    case $flag
+    in
+        a) ACK_MODE="$OPTARG" ;;
+        h) HEADERS+=("$OPTARG") ;;
+        k) ROUTING_KEY="$OPTARG" ;;
+        n) SOURCE_NODENAME="$OPTARG" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[[ $# -ge 2 ]] || die "Usage: $(basename "$0") [-a ack_mode] [-k routing_key] [-h header_name=header_value]... [source_uri] source_queue [destination_uri] destination_exchange"
+
+if [[ $# -ge 3 ]]
+then
+    SOURCE_URI="$1"
+    shift
+else
+    SOURCE_URI="amqp://$(hostname -f)"
+fi
+
+SOURCE_QUEUE="$1"
+shift
+
+if [[ $# -ge 2 ]]
+then
+    DESTINATION_URI="$1"
+    shift
+else
+    DESTINATION_URI="$SOURCE_URI"
+fi
+
+DESTINATION_EXCHANGE="$1"
+shift
+
+[[ $# -eq 0 ]] || die "Unexpected parameters: $*"
+
+## Parse URIs ##################################################################
+
+parse_amqp_uri() {
+    echo "$1" | sed -rn "s|^amqps?://([^:@]+(:[^@]+)?@)?([^./]+)(\.[^./]+)*(:[0-9]*)?(/.*)?$|\3|p"
+}
+
+SOURCE_HOSTNAME="$(parse_amqp_uri "$SOURCE_URI")"
+
+[[ -n "$SOURCE_HOSTNAME" ]] || die "The source URI does not appear to be valid"
+[[ -n "$(parse_amqp_uri "$DESTINATION_URI")" ]] || die "The destination URI does not appear to be valid"
+
+## Derive source nodename ######################################################
+
+if [[ ! "$SOURCE_NODENAME" =~ @ ]]
+then
+    SOURCE_NODENAME="$SOURCE_NODENAME@$SOURCE_HOSTNAME"
+fi
+
+[[ ! "$SOURCE_NODENAME" =~ localhost ]] || die "The source nodename (which may have been derived from the source URI) must use a real host name rather than localhost"
+
+## Check prerequisites for execution ###########################################
+
+[[ "$USER" == root ]] || die "This script must be run as root"
+which rabbitmq-server >/dev/null && which rabbitmq-plugins >/dev/null && which rabbitmqctl >/dev/null || die "The rabbitmq executables must be on the path"
+rabbitmq-plugins list -e rabbitmq_shovel | grep . >/dev/null || die "The rabbitmq_shovel plugin must be enabled"
+
+## Check that there are messages to shovel######################################
+
+source_queue_depth() {
+    echo $(rabbitmqctl -n "$SOURCE_NODENAME" -q list_queues name messages | sed -rn "s/^$SOURCE_QUEUE\t([0-9]*)$/\1/p")
+}
+
+[[ $(source_queue_depth) -gt 0 ]] || die "The source queue is empty"
+
+## Generate configuration file #################################################
+
+# needed because old mktemp needs the Xs at the end
+mktempsuffix() {
+    local TEMPLATE="$1"
+    local SUFFIX="$2"
+    local ROOT="$(mktemp -t "$TEMPLATE")"
+    local NAME="$ROOT$SUFFIX"
+    mv "$ROOT" "$NAME"
+    echo "$NAME"
+}
+
+SHOVEL_CONFIG_FILE="$(mktempsuffix "$(basename "$0")-XXXXXXXXXX" .config)"
+trap "rm \"$SHOVEL_CONFIG_FILE\"" 0
+chmod a+r "$SHOVEL_CONFIG_FILE"
+SHOVEL_NODENAME="$(basename "$SHOVEL_CONFIG_FILE" .config)"
+
+if [[ -n "$ROUTING_KEY" ]]
+then
+    ROUTING_KEY_CLAUSE=", {routing_key, <<\"$ROUTING_KEY\">>}"
+fi
+
+FORMATTED_HEADERS=("${HEADERS[@]}")
+HEADER_LEADER="{<<\"";                  FORMATTED_HEADERS=("${FORMATTED_HEADERS[@]/#/$HEADER_LEADER}")
+HEADER_SEPARATOR="\">>, longstr, <<\""; FORMATTED_HEADERS=("${FORMATTED_HEADERS[@]/=/$HEADER_SEPARATOR}")
+HEADER_TRAILER="\">>},";                FORMATTED_HEADERS=("${FORMATTED_HEADERS[@]/%/$HEADER_TRAILER}")
+
+# we add the bonus nodename header partly to be helpful, and partly to sidestep the trailing comma problem; u mad?
+
+cat >"$SHOVEL_CONFIG_FILE" <<EOF
+[
+   {rabbit, [
+      {tcp_listeners, []}
+   ]},
+   {rabbitmq_stomp, [
+      {tcp_listeners, []}
+   ]},
+   {rabbitmq_management, [
+      {listener, [{port, 15673}]}
+   ]},
+   {rabbitmq_shovel, [
+      {shovels, [
+         {the_shoveller, [
+            {sources, [
+               {broker, "$SOURCE_URI"}
+            ]},
+            {destinations, [
+               {broker, "$DESTINATION_URI"}
+            ]},
+            {queue, <<"$SOURCE_QUEUE">>},
+            {publish_fields, [
+               {exchange, <<"$DESTINATION_EXCHANGE">>}
+               ${ROUTING_KEY_CLAUSE:-}
+            ]},
+            {publish_properties, [
+               {headers, [
+                  ${FORMATTED_HEADERS[*]} {<<"$(basename "$0")-nodename">>, longstr, <<"$RABBITMQ_NODENAME">>}
+               ]}
+            ]},
+            {ack_mode, '$ACK_MODE'}
+         ]}
+      ]}
+   ]}
+].
+EOF
+
+## Start the shovel ############################################################
+
+SHOVEL_PID_FILE="${SHOVEL_CONFIG_FILE%.config}.pid"
+trap "rm -f \"$SHOVEL_PID_FILE\"" 0
+
+echo "Starting shovel node $SHOVEL_NODENAME ..."
+# can't use the -detached flag, because then rabbitmq doesn't write a pidfile (wtf)
+RABBITMQ_NODENAME="$SHOVEL_NODENAME" \
+    RABBITMQ_CONFIG_FILE="${SHOVEL_CONFIG_FILE%.config}" \
+    RABBITMQ_PID_FILE="$SHOVEL_PID_FILE" \
+    rabbitmq-server &
+
+echo "Waiting for shovel node $SHOVEL_NODENAME ..."
+rabbitmqctl -n "$SHOVEL_NODENAME" wait "$SHOVEL_PID_FILE"
+
+echo "Started shovel node $SHOVEL_NODENAME"
+
+## Wait for all the messages to be shovelled ###################################
+
+while [[ $(source_queue_depth) -gt 0 ]]
+do
+    sleep 1
+done
+
+## Stop the shovel #############################################################
+
+echo "Stopping shovel node $SHOVEL_NODENAME ..."
+rabbitmqctl -n "$SHOVEL_NODENAME" stop "$SHOVEL_PID_FILE"
+echo "Stopped shovel node $SHOVEL_NODENAME"
+

@@ -1,0 +1,51 @@
+#! /bin/bash -eu
+
+PATH="$PATH:."
+
+COUNT=0
+SUCCESSES=0
+FAILURES=0
+
+assertfail() {
+	local COMMAND="$1"
+	local EXPECTED_OUTPUT="$2"
+	local OUTPUT
+	STATUS=0
+	OUTPUT="$($COMMAND 2>&1)" || STATUS=$?
+	local FAILED=
+	[[ $STATUS -ne 0 ]] || { echo -e "Command line:\n$COMMAND\nShould have exited with nonzero status, but did not" && FAILED=y; }
+	[[ "$OUTPUT" =~ "$EXPECTED_OUTPUT" ]] || { echo -e "Command line: $COMMAND\nShould have produced output: $EXPECTED_OUTPUT\nBut produced: $OUTPUT" && FAILED=y; }
+	COUNT=$((COUNT + 1))
+	if [[ -z "$FAILED" ]]
+	then
+		SUCCESSES=$((SUCCESSES + 1))
+	else
+		FAILURES=$((FAILURES + 1))
+		echo
+	fi
+}
+
+assertfail "rabbitmq-shovel" \
+	"Usage: "
+
+assertfail "rabbitmq-shovel bmqp://ldn-dev-tanderson.youdevise.com eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
+	"The source URI does not appear to be valid"
+
+assertfail "rabbitmq-shovel amqp://ldn-dev-tanderson.youdevise.com eod_prices_latest bmqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
+	"The destination URI does not appear to be valid"
+
+assertfail "rabbitmq-shovel amqp://localhost eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
+	"The source nodename (which may have been derived from the source URI) must use a real host name rather than localhost"
+
+assertfail "rabbitmq-shovel -n rabbit@localhost amqp://ldn-dev-tanderson.youdevise.com eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
+	"The source nodename (which may have been derived from the source URI) must use a real host name rather than localhost"
+
+assertfail "sudo -u nobody $(which rabbitmq-shovel) amqp://ldn-dev-tanderson.youdevise.com eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
+	"This script must be run as root"
+	
+assertfail "rabbitmq-shovel amqp://ldn-dev-tanderson.youdevise.com eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
+	"The source queue is empty"
+
+echo
+echo "Ran $COUNT tests; $SUCCESSES successes, $FAILURES failures"
+
