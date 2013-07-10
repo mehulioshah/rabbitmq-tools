@@ -1,6 +1,6 @@
 #! /bin/bash -eu
 
-PATH="$PATH:."
+PATH="$PATH:$(dirname "$0")/../bin"
 
 COUNT=0
 SUCCESSES=0
@@ -42,7 +42,7 @@ assertfail "rabbitmq-shovel -n rabbit@localhost amqp://ldn-dev-tanderson.youdevi
 
 assertfail "sudo -u nobody $(which rabbitmq-shovel) amqp://ldn-dev-tanderson.youdevise.com eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
 	"This script must be run as root"
-	
+
 assertfail "rabbitmq-shovel amqp://ldn-dev-tanderson.youdevise.com eod_prices_latest amqp://ldn-dev-tanderson.youdevise.com eod_prices_dead_letter" \
 	"The source queue is empty"
 
